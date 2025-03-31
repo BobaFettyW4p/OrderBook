@@ -10,12 +10,13 @@
 #include <vector>
 #include <optional>
 #include <functional>
+#include <list>
 
 namespace OrderBook {
 
 // Forward declarations
-struct Order;
-struct Limit;
+class Order;
+class Limit;
 
 // Thread-safe queue for order operations
 template<typename T>
@@ -100,31 +101,6 @@ struct OrderRequest {
     int entryTime;
 };
 
-struct Order {
-    int idNumber;
-    bool buyOrSell;  // true for buy, false for sell
-    int shares;
-    int limit;
-    int entryTime;
-    int eventTime;
-    Order* next;
-    Order* prev;
-    Limit* parentLimit;
-    std::atomic<bool> active{true}; // Atomic flag for order status
-};
-
-struct Limit {
-    int limitPrice;
-    std::atomic<int> size{0};
-    Limit* parent;
-    Limit* leftChild;
-    Limit* rightChild;
-    Order* headOrder;
-    Order* tailOrder;
-    std::atomic<int> orderCount{0};
-    std::mutex limitMutex; // We need a mutex per limit level for linked list operations
-};
-
 // Execution report for matched orders
 struct ExecutionReport {
     int buyOrderId;
@@ -134,12 +110,55 @@ struct ExecutionReport {
     int timestamp;
 };
 
+// Memory-safe Order class
+class Order {
+public:
+    int idNumber;
+    bool buyOrSell;  // true for buy, false for sell
+    int shares;
+    int limit;
+    int entryTime;
+    int eventTime;
+    std::atomic<bool> active{true}; // Atomic flag for order status
+    
+    // Smart pointers for linked list
+    std::shared_ptr<Order> next;
+    std::weak_ptr<Order> prev;
+    std::weak_ptr<Limit> parentLimit;
+    
+    Order() = default;
+    Order(int id, bool isBuy, int qty, int price, int time) 
+        : idNumber(id), buyOrSell(isBuy), shares(qty), limit(price), 
+          entryTime(time), eventTime(time), active(true) {}
+};
+
+// Memory-safe Limit class
+class Limit {
+public:
+    int limitPrice;
+    std::atomic<int> size{0};
+    std::atomic<int> orderCount{0};
+    std::mutex limitMutex; // We need a mutex per limit level for linked list operations
+    
+    // Smart pointers for binary tree structure
+    std::weak_ptr<Limit> parent;
+    std::shared_ptr<Limit> leftChild;
+    std::shared_ptr<Limit> rightChild;
+    
+    // Linked list of orders at this limit
+    std::shared_ptr<Order> headOrder;
+    std::shared_ptr<Order> tailOrder;
+    
+    Limit() = default;
+    explicit Limit(int price) : limitPrice(price) {}
+};
+
 class OrderBook {
 private:
-    Limit* buyTree;
-    Limit* sellTree;
-    std::unordered_map<int, std::unique_ptr<Order>> orderMap;
-    std::unordered_map<int, std::unique_ptr<Limit>> limitMap;
+    std::shared_ptr<Limit> buyTree;
+    std::shared_ptr<Limit> sellTree;
+    std::unordered_map<int, std::shared_ptr<Order>> orderMap;
+    std::unordered_map<int, std::shared_ptr<Limit>> limitMap;
     
     // Thread synchronization primitives
     mutable std::mutex bookMutex; // Protects tree structure and maps
@@ -150,7 +169,7 @@ private:
     std::atomic<int> nextOrderId{1};
     
     // Helper methods for tree operations
-    Limit* insertLimit(Limit* root, Limit* newLimit, bool isBuy) {
+    std::shared_ptr<Limit> insertLimit(std::shared_ptr<Limit> root, std::shared_ptr<Limit> newLimit, bool isBuy) {
         if (!root) {
             return newLimit;
         }
@@ -158,16 +177,20 @@ private:
         if ((isBuy && newLimit->limitPrice > root->limitPrice) ||
             (!isBuy && newLimit->limitPrice < root->limitPrice)) {
             root->rightChild = insertLimit(root->rightChild, newLimit, isBuy);
-            root->rightChild->parent = root;
+            if (root->rightChild) {
+                root->rightChild->parent = root;
+            }
         } else {
             root->leftChild = insertLimit(root->leftChild, newLimit, isBuy);
-            root->leftChild->parent = root;
+            if (root->leftChild) {
+                root->leftChild->parent = root;
+            }
         }
         
         return root;
     }
     
-    Limit* findLimit(Limit* root, int price) const {
+    std::shared_ptr<Limit> findLimit(std::shared_ptr<Limit> root, int price) const {
         if (!root) return nullptr;
         
         if (root->limitPrice == price) {
@@ -180,7 +203,7 @@ private:
         }
     }
     
-    void addOrder(Order* order, Limit* limit) {
+    void addOrder(std::shared_ptr<Order> order, std::shared_ptr<Limit> limit) {
         // Lock the specific limit level
         std::lock_guard<std::mutex> lock(limit->limitMutex);
         
@@ -193,7 +216,9 @@ private:
             limit->tailOrder = order;
         } else {
             order->prev = limit->tailOrder;
-            limit->tailOrder->next = order;
+            if (limit->tailOrder) {
+                limit->tailOrder->next = order;
+            }
             limit->tailOrder = order;
         }
         
@@ -232,30 +257,16 @@ private:
     void processAddOrder(int orderId, bool isBuy, int shares, int price, int entryTime) {
         std::lock_guard<std::mutex> lock(bookMutex);
         
-        // Create new order
-        auto order = std::make_unique<Order>();
-        order->idNumber = orderId;
-        order->buyOrSell = isBuy;
-        order->shares = shares;
-        order->limit = price;
-        order->entryTime = entryTime;
-        order->eventTime = entryTime;
-        order->next = nullptr;
-        order->prev = nullptr;
-        order->active.store(true);
+        // Create new order using make_shared
+        auto order = std::make_shared<Order>(orderId, isBuy, shares, price, entryTime);
         
         // Find or create limit price level
-        Limit* limit;
+        std::shared_ptr<Limit> limit;
         auto it = limitMap.find(price);
         if (it == limitMap.end()) {
             // Create new limit level
-            auto newLimit = std::make_unique<Limit>();
-            newLimit->limitPrice = price;
-            newLimit->size.store(0);
-            newLimit->orderCount.store(0);
-            newLimit->headOrder = nullptr;
-            newLimit->tailOrder = nullptr;
-            limit = newLimit.get();
+            auto newLimit = std::make_shared<Limit>(price);
+            limit = newLimit;
             
             // Insert into appropriate tree
             if (isBuy) {
@@ -264,15 +275,14 @@ private:
                 sellTree = insertLimit(sellTree, limit, false);
             }
             
-            limitMap[price] = std::move(newLimit);
+            limitMap[price] = limit;
         } else {
-            limit = it->second.get();
+            limit = it->second;
         }
         
         // Add order to limit level
-        Order* orderPtr = order.get();
-        addOrder(orderPtr, limit);
-        orderMap[orderId] = std::move(order);
+        addOrder(order, limit);
+        orderMap[orderId] = order;
         
         // Schedule matching after adding order
         OrderRequest matchRequest;
@@ -288,7 +298,7 @@ private:
             return false;
         }
         
-        Order* order = it->second.get();
+        auto order = it->second;
         
         // Mark order as inactive atomically
         if (!order->active.exchange(false)) {
@@ -296,27 +306,34 @@ private:
             return false;
         }
         
-        Limit* limit = order->parentLimit;
+        auto limitPtr = order->parentLimit.lock();
+        if (!limitPtr) {
+            orderMap.erase(orderId);
+            return true;
+        }
         
         {
             // Lock the specific limit level
-            std::lock_guard<std::mutex> limitLock(limit->limitMutex);
+            std::lock_guard<std::mutex> limitLock(limitPtr->limitMutex);
             
             // Update limit size and count atomically
-            limit->size.fetch_sub(order->shares);
-            limit->orderCount.fetch_sub(1);
+            limitPtr->size.fetch_sub(order->shares);
+            limitPtr->orderCount.fetch_sub(1);
             
             // Update linked list pointers
-            if (order->prev) {
-                order->prev->next = order->next;
-            } else {
-                limit->headOrder = order->next;
+            auto prevOrder = order->prev.lock();
+            if (prevOrder) {
+                prevOrder->next = order->next;
+            } else if (limitPtr->headOrder == order) {
+                limitPtr->headOrder = order->next;
             }
             
             if (order->next) {
-                order->next->prev = order->prev;
-            } else {
-                limit->tailOrder = order->prev;
+                if (auto nextOrder = order->next) {
+                    nextOrder->prev = order->prev;
+                }
+            } else if (limitPtr->tailOrder == order) {
+                limitPtr->tailOrder = prevOrder;
             }
         }
         
@@ -334,22 +351,25 @@ private:
             return false;
         }
         
-        Order* order = it->second.get();
+        auto order = it->second;
         
         // Check if order is active
         if (!order->active.load()) {
             return false;
         }
         
-        Limit* limit = order->parentLimit;
+        auto limitPtr = order->parentLimit.lock();
+        if (!limitPtr) {
+            return false;
+        }
         
         {
             // Lock the specific limit level
-            std::lock_guard<std::mutex> limitLock(limit->limitMutex);
+            std::lock_guard<std::mutex> limitLock(limitPtr->limitMutex);
             
             // Update limit size atomically
             int oldShares = order->shares;
-            limit->size.fetch_add(newShares - oldShares);
+            limitPtr->size.fetch_add(newShares - oldShares);
             
             // Update order shares
             order->shares = newShares;
@@ -371,12 +391,12 @@ private:
         }
         
         // Find best bid and ask prices
-        Limit* bestBid = buyTree;
+        auto bestBid = buyTree;
         while (bestBid->rightChild) {
             bestBid = bestBid->rightChild;
         }
         
-        Limit* bestAsk = sellTree;
+        auto bestAsk = sellTree;
         while (bestAsk->leftChild) {
             bestAsk = bestAsk->leftChild;
         }
@@ -386,8 +406,8 @@ private:
             std::lock_guard<std::mutex> bidLock(bestBid->limitMutex);
             std::lock_guard<std::mutex> askLock(bestAsk->limitMutex);
             
-            Order* buyOrder = bestBid->headOrder;
-            Order* sellOrder = bestAsk->headOrder;
+            auto buyOrder = bestBid->headOrder;
+            auto sellOrder = bestAsk->headOrder;
             
             // Both orders should be active
             if (!buyOrder || !sellOrder || !buyOrder->active.load() || !sellOrder->active.load()) {
@@ -424,7 +444,7 @@ private:
             if (removeBuyOrder) {
                 bestBid->headOrder = buyOrder->next;
                 if (bestBid->headOrder) {
-                    bestBid->headOrder->prev = nullptr;
+                    bestBid->headOrder->prev = std::weak_ptr<Order>();
                 } else {
                     bestBid->tailOrder = nullptr;
                 }
@@ -436,7 +456,7 @@ private:
             if (removeSellOrder) {
                 bestAsk->headOrder = sellOrder->next;
                 if (bestAsk->headOrder) {
-                    bestAsk->headOrder->prev = nullptr;
+                    bestAsk->headOrder->prev = std::weak_ptr<Order>();
                 } else {
                     bestAsk->tailOrder = nullptr;
                 }
@@ -454,11 +474,11 @@ private:
                         bestBid = bestBid->rightChild;
                     }
                 } else {
-                    Limit* current = bestBid;
-                    bestBid = bestBid->parent;
+                    auto current = bestBid;
+                    bestBid = current->parent.lock();
                     while (bestBid && bestBid->rightChild == current) {
                         current = bestBid;
-                        bestBid = bestBid->parent;
+                        bestBid = bestBid->parent.lock();
                     }
                 }
             }
@@ -471,11 +491,11 @@ private:
                         bestAsk = bestAsk->leftChild;
                     }
                 } else {
-                    Limit* current = bestAsk;
-                    bestAsk = bestAsk->parent;
+                    auto current = bestAsk;
+                    bestAsk = current->parent.lock();
                     while (bestAsk && bestAsk->leftChild == current) {
                         current = bestAsk;
-                        bestAsk = bestAsk->parent;
+                        bestAsk = bestAsk->parent.lock();
                     }
                 }
             }
@@ -493,17 +513,7 @@ public:
     
     ~OrderBook() {
         stop();
-        // Delete all limits and their orders in destructor
-        std::lock_guard<std::mutex> lock(bookMutex);
-        for (auto& pair : limitMap) {
-            Limit* limit = pair.second.get();
-            std::lock_guard<std::mutex> limitLock(limit->limitMutex);
-            Order* current = limit->headOrder;
-            while (current) {
-                Order* next = current->next;
-                current = next;
-            }
-        }
+        // Smart pointers will handle memory cleanup automatically
     }
     
     // Start order processing
@@ -577,7 +587,7 @@ public:
         std::lock_guard<std::mutex> lock(bookMutex);
         if (!buyTree) return 0;
         
-        Limit* current = buyTree;
+        auto current = buyTree;
         while (current->rightChild) {
             current = current->rightChild;
         }
@@ -588,7 +598,7 @@ public:
         std::lock_guard<std::mutex> lock(bookMutex);
         if (!sellTree) return 0;
         
-        Limit* current = sellTree;
+        auto current = sellTree;
         while (current->leftChild) {
             current = current->leftChild;
         }
@@ -631,6 +641,6 @@ public:
 } // namespace OrderBook
 
 // Non-member utility functions
-void printOrderDetails(const OrderBook::Order* order);
-void printLimitDetails(const OrderBook::Limit* limit);
+void printOrderDetails(const std::shared_ptr<OrderBook::Order>& order);
+void printLimitDetails(const std::shared_ptr<OrderBook::Limit>& limit);
 void runThreadedTest();

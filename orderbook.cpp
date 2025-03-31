@@ -28,7 +28,7 @@ void logMessage(const std::string& message) {
 }
 }
 
-void printOrderDetails(const OrderBook::Order* order) {
+void printOrderDetails(const std::shared_ptr<OrderBook::Order>& order) {
     if (!order) return;
     std::cout << "Order ID: " << order->idNumber << "\n"
               << "Type: " << (order->buyOrSell ? "Buy" : "Sell") << "\n"
@@ -39,14 +39,14 @@ void printOrderDetails(const OrderBook::Order* order) {
               << "Active: " << order->active.load() << "\n\n";
 }
 
-void printLimitDetails(const OrderBook::Limit* limit) {
+void printLimitDetails(const std::shared_ptr<OrderBook::Limit>& limit) {
     if (!limit) return;
     std::cout << "Limit Price: " << limit->limitPrice << "\n"
               << "Total Size: " << limit->size.load() << "\n"
               << "Order Count: " << limit->orderCount.load() << "\n\n";
     
     std::cout << "Orders at this limit:\n";
-    OrderBook::Order* currentOrder = limit->headOrder;
+    auto currentOrder = limit->headOrder;
     while (currentOrder) {
         printOrderDetails(currentOrder);
         currentOrder = currentOrder->next;
@@ -70,7 +70,7 @@ void runThreadedTest() {
     
     // Parameters for the test
     const int numThreads = 4;
-    const int ordersPerThread = 50; // Reduced from 50 to keep output manageable
+    const int ordersPerThread = 25; // Reduced to keep output manageable
     const int maxPrice = 100;
     const int maxShares = 100;
     
@@ -143,7 +143,7 @@ void runThreadedTest() {
 }
 
 int main() {
-    std::cout << "Starting multi-threaded OrderBook test...\n\n";
+    std::cout << "Starting multi-threaded OrderBook test with memory-safe implementation...\n\n";
     runThreadedTest();
     return 0;
 }
